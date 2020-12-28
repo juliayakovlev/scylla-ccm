@@ -1,5 +1,8 @@
 from __future__ import with_statement
 
+import random
+
+from time import sleep
 from typing import NamedTuple
 
 import os
@@ -24,7 +27,8 @@ from six import BytesIO
 import packaging.version
 
 from ccmlib.common import (
-    ArgumentError, get_default_path, rmdirs, validate_install_dir, get_scylla_version, aws_bucket_ls)
+    ArgumentError, get_default_path, rmdirs, validate_install_dir, get_scylla_version, aws_bucket_ls,
+    INSTALL_DIR_PLACEHOLDER_FILE, wait_for_parallel_download_finish, copy_recursively)
 from ccmlib.repository import __download
 
 GIT_REPO = "http://github.com/scylladb/scylla.git"
@@ -112,16 +116,16 @@ def release_packages(s3_url, version):
 def setup(version, verbose=True):
     """
     :param version:
-            Supported version values (examples):
-            1. Unstable versions:
-              - unstable/master:2020-12-20T00:11:59Z
-              - unstable/enterprise:2020-08-18T14:49:18Z
-              - unstable/branch-4.1:2020-05-30T08:27:59Z
-            2. Official version (released):
-              - release:4.3
-              - release:4.2.1
-              - release:2020.1 (SCYLLA_PRODUCT='enterprise')
-              - release:2020.1.5 (SCYLLA_PRODUCT='enterprise')
+    Supported version values (examples):
+    1. Unstable versions:
+      - unstable/master:2020-12-20T00:11:59Z
+      - unstable/enterprise:2020-08-18T14:49:18Z
+      - unstable/branch-4.1:2020-05-30T08:27:59Z
+    2. Official version (released):
+      - release:4.3
+      - release:4.2.1
+      - release:2020.1 (SCYLLA_PRODUCT='enterprise')
+      - release:2020.1.5 (SCYLLA_PRODUCT='enterprise')
 
     """
     s3_url = ''
@@ -131,7 +135,6 @@ def setup(version, verbose=True):
     packages = None
     if len(type_n_version) == 2:
         s3_version = type_n_version[1]
-        packages = None
 
         if type_n_version[0] == 'release':
             if 'enterprise' in scylla_product:
@@ -144,43 +147,68 @@ def setup(version, verbose=True):
                 s3_url = ENTERPRISE_RELOCATABLE_URLS_BASE.format(type_n_version[0], s3_version)
             else:
                 s3_url = RELOCATABLE_URLS_BASE.format(type_n_version[0], s3_version)
+            packages = RelocatablePackages(scylla_jmx_package=os.path.join(s3_url,
+                                                                           f'{scylla_product}-jmx-package.tar.gz'),
+                                           scylla_tools_package=os.path.join(s3_url,
+                                                                             f'{scylla_product}-tools-package.tar.gz'),
+                                           scylla_package=os.path.join(s3_url,
+                                                                       f'{scylla_product}-package.tar.gz'))
         version = os.path.join(*type_n_version)
 
-    cdir = version_directory(version)
+    version_dir = version_directory(version)
 
-    if cdir is None:
-        if not packages:
-            packages = RelocatablePackages(scylla_jmx_package=os.path.join(s3_url, f'{scylla_product}-jmx-package.tar.gz'),
-                                           scylla_tools_package=os.path.join(s3_url, f'{scylla_product}-tools-package.tar.gz'),
-                                           scylla_package=os.path.join(s3_url, f'{scylla_product}-package.tar.gz'))
+    if version_dir is None:
+        # Create version folder and add placeholder file to prevent parallel downloading from another test.
+        version_dir = directory_name(version)
+        placeholder_file = os.path.join(version_dir, INSTALL_DIR_PLACEHOLDER_FILE)
+        # If another parallel downloading has been started already, wait while it will be completed
+        if os.path.exists(placeholder_file):
+            wait_for_parallel_download_finish(placeholder_file)
+        else:
+            os.makedirs(version_dir)
+            run(f'touch {placeholder_file}')
+            package_version = download_packages(version_dir, packages, s3_url, scylla_product, version, verbose)
 
-        tmp_download = tempfile.mkdtemp()
+            # install using scylla install.sh
+            run_scylla_install_script(os.path.join(version_dir, 'scylla-core-package'), version_dir, package_version)
+            # os.remove(placeholder_file)
 
-        url = os.environ.get('SCYLLA_CORE_PACKAGE', packages.scylla_package)
-        package_version = download_version(version, verbose=verbose, url=url, target_dir=os.path.join(
-            tmp_download, 'scylla-core-package'))
-        # Try the old name for backward compatibility
-        url = os.environ.get("SCYLLA_TOOLS_JAVA_PACKAGE") or \
-              os.environ.get("SCYLLA_JAVA_TOOLS_PACKAGE") or \
-              packages.scylla_tools_package
-
-        download_version(version, verbose=verbose, url=url, target_dir=os.path.join(
-            tmp_download, 'scylla-tools-java'))
-
-        url = os.environ.get('SCYLLA_JMX_PACKAGE', packages.scylla_jmx_package)
-        download_version(version, verbose=verbose, url=url,
-                         target_dir=os.path.join(tmp_download, 'scylla-jmx'))
-
-        cdir = directory_name(version)
-
-        shutil.move(tmp_download, cdir)
-
-        # install using scylla install.sh
-        run_scylla_install_script(os.path.join(
-            cdir, 'scylla-core-package'), cdir, package_version)
     setup_scylla_manager()
 
-    return cdir, get_scylla_version(cdir)
+    return version_dir, get_scylla_version(version_dir)
+
+
+def download_packages(version_dir, packages, s3_url, scylla_product, version, verbose):
+    if not packages and not s3_url:
+        packages = RelocatablePackages(scylla_jmx_package=os.environ.get('SCYLLA_JMX_PACKAGE'),
+                                       scylla_tools_package=os.environ.get("SCYLLA_TOOLS_JAVA_PACKAGE") or
+                                                            os.environ.get("SCYLLA_JAVA_TOOLS_PACKAGE"),
+                                       scylla_package=os.environ.get('SCYLLA_CORE_PACKAGE')
+                                       )
+
+        if not packages:
+            raise EnvironmentError("Not found environment parameters: 'SCYLLA_JMX_PACKAGE' and "
+                                   "('SCYLLA_TOOLS_JAVA_PACKAGE' or 'SCYLLA_JAVA_TOOLS_PACKAGE) and"
+                                   "'SCYLLA_CORE_PACKAGE'")
+
+    tmp_download = tempfile.mkdtemp()
+
+    package_version = download_version(version, verbose=verbose, url=packages.scylla_package,
+                                       target_dir=os.path.join(tmp_download, 'scylla-core-package'))
+
+    download_version(version, verbose=verbose, url=packages.scylla_tools_package,
+                     target_dir=os.path.join(tmp_download, 'scylla-tools-java'))
+
+    download_version(version, verbose=verbose, url=packages.scylla_jmx_package,
+                     target_dir=os.path.join(tmp_download, 'scylla-jmx'))
+
+    shutil.rmtree(version_dir)
+    shutil.move(tmp_download, version_dir)
+    # copy_recursively(tmp_download, version_dir)
+    #
+    # shutil.rmtree(tmp_download)
+
+    return package_version
 
 
 def setup_scylla_manager():
@@ -323,6 +351,11 @@ def directory_name(version):
 
 def version_directory(version):
     dir = directory_name(version)
+    if not os.path.exists(dir):
+        # If few tests will run simultaneously with same version and try to download the relocatable packages,
+        # let to one of the tests privilege to start first
+        sleep(random.randint(0, 5))
+
     if os.path.exists(dir):
         try:
             validate_install_dir(dir)
@@ -356,5 +389,5 @@ def run_scylla_install_script(install_dir, target_dir, package_version):
         install_dir, scylla_target_dir, install_opt), cwd=install_dir)
     run('''mkdir -p {0}/conf; cp ./conf/scylla.yaml {0}/conf'''.format(
         scylla_target_dir), cwd=install_dir)
-    run('''ln -s {}/bin .'''.format(scylla_target_dir), cwd=target_dir)
-    run('''ln -s {}/conf .'''.format(scylla_target_dir), cwd=target_dir)
+    run('''ln -s -f {}/bin .'''.format(scylla_target_dir), cwd=target_dir)
+    run('''ln -s -f {}/conf .'''.format(scylla_target_dir), cwd=target_dir)

@@ -43,6 +43,8 @@ CASSANDRA_SH = "cassandra.in.sh"
 CONFIG_FILE = "config"
 CCM_CONFIG_DIR = "CCM_CONFIG_DIR"
 
+INSTALL_DIR_PLACEHOLDER_FILE = "placeholder"
+
 logger = logging.getLogger('ccm')
 
 class CCMError(Exception):
@@ -454,9 +456,42 @@ def scylla_extract_install_dir_and_mode(install_dir):
     return install_dir, scylla_mode
 
 
+def check_file_exists(path_to_file):
+    if os.path.exists(path_to_file):
+        return True
+    return False
+
+
+def _wait_until_false(wait_seconds, func, kwargs):
+    start_time = time.time()
+    wait_time_sec = 5
+    while True:
+        if not func(**kwargs):
+            return True
+        elapsed = time.time() - start_time
+        if elapsed >= wait_seconds:
+            return False
+        time.sleep(wait_time_sec)
+        if elapsed + wait_time_sec > wait_seconds:
+            wait_time_sec = wait_seconds - elapsed
+        elif wait_time_sec <= 16:
+            wait_time_sec *= 2
+
+
+def wait_for_parallel_download_finish(placeholder_file):
+    if check_file_exists(placeholder_file):
+        if not _wait_until_false(3600, check_file_exists, kwargs={'path_to_file': placeholder_file}):
+            raise TimeoutError(f"Relocatables download still runs in parallel from another test after 60 min. "
+                               f"Placeholder file exists: {placeholder_file}")
+
+
 def validate_install_dir(install_dir):
     if install_dir is None:
         raise ArgumentError('Undefined installation directory')
+
+    # If relocatables download is running in parallel from another test, the install_dir exists with placehoslder file
+    # in the folder. Once it will be downloaded and installed, this file will be removed.
+    wait_for_parallel_download_finish(os.path.join(install_dir, INSTALL_DIR_PLACEHOLDER_FILE))
 
     # Windows requires absolute pathing on installation dir - abort if specified cygwin style
     if is_win():
@@ -591,6 +626,20 @@ def copy_directory(src_dir, dst_dir):
         filename = os.path.join(src_dir, name)
         if os.path.isfile(filename):
             shutil.copy(filename, dst_dir)
+
+
+def copy_recursively(source_folder, destination_folder):
+    for root, dirs, files in os.walk(source_folder):
+        for item in files:
+            src_path = os.path.join(root, item)
+            dst_path = os.path.join(destination_folder, src_path.replace(source_folder, ""))
+            shutil.copy2(src_path, dst_path)
+
+        for item in dirs:
+            src_path = os.path.join(root, item)
+            dst_path = os.path.join(destination_folder, src_path.replace(source_folder, ""))
+            if not os.path.exists(dst_path):
+                os.mkdir(dst_path)
 
 
 def get_version_from_build(install_dir=None, node_path=None):
